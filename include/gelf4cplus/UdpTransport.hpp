@@ -67,7 +67,7 @@ public:
     UdpTransport(const string &aDstHost = "localhost",
                  const int &aDstPort = DEFAULT_GRAYLOG2_PORT,
                  const uint16_t &aMaxChunkSize = DEFAULT_CHUNK_SIZE) :
-                 m_maxChunkSize(aMaxChunkSize)
+                 m_maxChunkSize(aMaxChunkSize), m_work(m_service)
     {
         // Build the id string using the IP, PID, and TID
         std::ostringstream ss;
@@ -83,6 +83,7 @@ public:
                                                     boost::lexical_cast<string>(aDstPort));
         m_endpoint = *resolver.resolve(query);
         m_socket = new boost::asio::ip::udp::socket(m_service, m_endpoint.protocol());
+        m_workThread = std::thread([this]{ m_service.run(); });
     }
 
     /**
@@ -90,6 +91,8 @@ public:
      */
     virtual ~UdpTransport()
     {
+        m_service.stop();
+        m_workThread.join();
         delete m_socket;
         m_socket = NULL;
     }
@@ -122,8 +125,7 @@ public:
     {
         size_t length = aMessage.length();
 
-        if (m_maxChunkSize != DISABLE_CHUNKING &&
-                length > m_maxChunkSize)
+        if (m_maxChunkSize != DISABLE_CHUNKING && length > m_maxChunkSize)
         {
             size_t chunkCount = (length / m_maxChunkSize) + 1;
             string messageId;
@@ -131,19 +133,21 @@ public:
 
             for (size_t i = 0; i < chunkCount; ++i)
             {
-                string messageChunkPrefix;
-                createChunkedMessagePart(messageId, i, chunkCount, messageChunkPrefix);
+                auto msg = std::make_unique<string>();
+                createChunkedMessagePart(messageId, i, chunkCount, *msg);
                 size_t skip = i * m_maxChunkSize;
 
                 // Send the message chunk to the UDP endpoint
-                m_socket->async_send_to(boost::asio::buffer(messageChunkPrefix + aMessage.substr(skip, m_maxChunkSize)),
-                                        m_endpoint, boost::bind(&UdpTransport::handler, this));
+                msg->append(aMessage.substr(skip, m_maxChunkSize));
+                m_socket->async_send_to(boost::asio::buffer(*messageChunkPrefix),
+                                        m_endpoint, [msg = std::move(msg)] (const boost::system::error_code& error, std::size_t bytes_transferred) {});
             }
         }
         else
         {
             // Send the message to the UDP endpoint
-            m_socket->async_send_to(boost::asio::buffer(aMessage), m_endpoint, boost::bind(&UdpTransport::handler, this));
+            auto msg = std::make_unique<std::string>(aMessage);
+            m_socket->async_send_to(boost::asio::buffer(*msg), m_endpoint, [msg = std::move(msg)] (const boost::system::error_code& error, std::size_t bytes_transferred) {});
         }
     }
 
@@ -160,6 +164,9 @@ protected:
     boost::asio::ip::udp::socket *m_socket; ///< The Boost socket.
     boost::asio::io_service m_service; ///< The Boost IO service.
     string m_threadId; ///< The thread ID.
+    std::thread m_workThread;
+    boost::asio::io_service::work m_work;
+
 
     // Methods
 
@@ -205,13 +212,6 @@ protected:
 
         // Return a byte array of the hash using std::string
         aMessageId.assign((char*) &hash, MAX_HEADER_SIZE);
-    }
-
-    /**
-     * Dummy handler for the Boost async_send_to()
-     */
-    virtual void handler()
-    {
     }
 };
 
